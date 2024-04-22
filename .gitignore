@@ -3,3 +3,6 @@ config.py
 ws2
 __pycache__
 output
+.ipynb_checkpoints
+logs
+plugins
