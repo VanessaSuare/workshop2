@@ -32,10 +32,7 @@ Prepare the database and pre-load Grammy data using scripts in the **dags** dire
 ## Airflow Automation <a name="airflow-automation"></a>
 Automate ETL processes using Airflow managed through:
 - **Dags Connection**: Manages the DAG connections in Airflow.
-- **ETL**: Contains scripts for individual ETL tasks:
-  - `grammy_etl`
-  - `spotify_etl`
-  - `merge_load_data`
+- **ETL**: Contains functions for ETL tasks and the dag for the workflow.
 
 ### Running Airflow
 1. Ensure Docker is running.
