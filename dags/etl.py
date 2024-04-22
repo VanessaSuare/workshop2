@@ -1,118 +1,129 @@
-''' Etl functions '''
-
+import json
 import logging
-import csv
 import pandas as pd
-import psycopg2
-import sys
-sys.path.append('/opt/airflow/dbconfig')
-sys.path.append('../dbconfig/')
-from dbconfig import configuration
+from sqlalchemy import create_engine
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from io import BytesIO
 
+# Configuration paths and file names
+config_path = '/opt/airflow/config/config.json'
+spotify_file = '/opt/airflow/data/spotify_dataset.csv'
+grammy_file = '/opt/airflow/data/the_grammy_awards.csv'
+output_file_path = '/opt/airflow/outputs/merged_data.csv'
 
-def extract_spotify_data():
-    '''Function to extract the data of spotify_dataset'''
+def load_config():
+    with open(config_path, 'r') as file:
+        return json.load(file)
 
-    path = '/opt/airflow/data/spotify_dataset.csv'
+def read_spotify_data():
+    logging.info("Extracting Spotify data...")
+    return pd.read_csv(spotify_file)
 
-    logging.info("Starting data extraction") 
-    try:
-        spotify_df = pd.read_csv(path)
-    except pd.exceptions.RequestException as e:
-        return f"Error: {e}"
+def read_and_store_grammy_data():
+    config = load_config()
+    db_url = f"postgresql+pg8000://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['dbname']}"
+    engine = create_engine(db_url)
+    grammy_data = pd.read_csv(grammy_file)
+    grammy_data.to_sql('grammy_awards', engine, index=False, if_exists='replace')
+    logging.info("Grammy data loaded to DB.")
 
-    logging.info("Spotify data extraction finished")
-    return spotify_df
+def fetch_grammy_data():
+    config = load_config()
+    db_url = f"postgresql+pg8000://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['dbname']}"
+    engine = create_engine(db_url)
+    return pd.read_sql_table('grammy_awards', engine)
 
+def apply_transformations_to_spotify(data):
+    # Define the genre categories with their respective sub-genres
+    genre_mapping = {
+        'Rock': ['alt-rock', 'grunge', 'hard-rock', 'punk-rock', 'rock', 'rock-n-roll', 'goth', 'punk', 'psych-rock', 'j-rock', 'acoustic', 'british', 'rockabilly'],
+        'Pop': ['pop', 'power-pop', 'pop-film', 'k-pop', 'j-pop', 'cantopop', 'children', 'disney', 'happy', 'kids', 'mandopop', 'mpb', 'power-pop', 'romance', 'sad', 'singer-songwriter', 'spanish'],
+        'Electronic/Dance': ['electronic', 'dubstep', 'edm', 'electro', 'techno', 'trance', 'house', 'deep-house', 'disco', 'dancehall', 'chicago-house', 'detroit-techno', 'hardstyle', 'minimal-techno', 'j-dance', 'party', 'breakbeat', 'drum-and-bass', 'dub', 'progressive-house', 'trip-hop'],
+        'Hip-Hop/R&B': ['hip-hop', 'r-n-b', 'j-idol', 'afrobeat'],
+        'Metal': ['black-metal', 'death-metal', 'heavy-metal', 'metal', 'metalcore', 'grindcore', 'industrial', 'hardcore'],
+        'Jazz/Blues': ['jazz', 'blues'],
+        'Folk/Country': ['folk', 'country', 'bluegrass', 'forro', 'honky-tonk'],
+        'Latin': ['latin', 'salsa', 'samba', 'reggaeton', 'latino'],
+        'Classical/Opera': ['classical', 'opera', 'piano'],
+        'Indie/Alternative': ['alternative', 'indie', 'indie-pop', 'singer-songwriter', 'emo', 'ska'],
+        'World Music': ['world-music', 'brazil', 'indian', 'iranian', 'malay', 'mandopop', 'swedish', 'turkish', 'french', 'german', 'reggae', 'synth-pop'],
+        'Ambient/Chill/Downtempo': ['ambient', 'chill', 'new-age', 'sleep', 'tango', 'study'],
+        'Funk/Soul': ['funk', 'soul', 'gospel', 'groove']
+    }
 
-def transform_spotify_data(spotify_data):
-    '''Function to transform the spotify_data'''
+    # Initialize all tracks as 'Other'
+    data['genre'] = 'Other'
 
-    columns_to_drop = [
-        'instrumentalness',
-        'acousticness',
-        'speechiness',
-        'mode',
-        'liveness',
-        'key',
+    # Assign genres based on the mapping
+    for genre, sub_genres in genre_mapping.items():
+        data.loc[data['track_genre'].isin(sub_genres), 'genre'] = genre
+
+    # Drop duplicates based on track ID
+    data.drop_duplicates(subset=['track_id'], inplace=True)
+
+    # Ensure that the 'artists' column does not contain NaN values
+    data['artists'] = data['artists'].fillna('Unknown Artist')
+
+    # Extract the lead artist from 'artists' (assuming multiple artists are separated by semicolons)
+    data['lead_artist'] = data['artists'].apply(lambda x: x.split(';')[0])
+
+    # Categorize 'popularity' into three levels
+    data['popularity_level'] = pd.cut(data['popularity'], bins=[0, 33, 66, 100], labels=['Low', 'Medium', 'High'])
+
+    # Define columns that are unnecessary and drop them
+    unwanted_columns = [
+        'Unnamed: 0',
         'track_id',
+        'key',
+        'mode',
+        'instrumentalness',
+        'time_signature',
+        'liveness',
+        'valence'
     ]
+    data.drop(columns=unwanted_columns, inplace=True)
 
-    spotify_data.drop(columns=columns_to_drop, axis=1, inplace=True)
+    # Further data cleanup and transformations can be added here
     logging.info("Transformations applied to Spotify data")
 
-    return spotify_data
+    return data
 
+def clean_grammy_data(data):
+    data['artist_clean'] = data['artist'].fillna(data['workers']).str.extract(r'([^\+]+)')[0]
+    data['category_clean'] = data['category'].str.replace(r'\[|\]', '', regex=True)
+    return data
 
-def load_spotify_data(spotify_data):
-    ''' Function to load the spotify_data'''
-    spotify_data.to_csv('/opt/airflow/outputs/spotify.csv', index=False)
-    logging.info("Spotify data loaded into the output file")
+def merge_data_sets(spotify, grammy):
+    merged_data = pd.merge(spotify, grammy, left_on='track_name', right_on='nominee', how='left')
+    merged_data.drop(columns=['workers', 'artist', 'year', 'img', 'updated_at', 'published_at'], inplace=True)
+    merged_data.fillna({'title': 'not nominated', 'category': 'not nominated', 'nominee': 'not nominated', 'winner': False}, inplace=True)
+    return merged_data
 
-
-
-def load_grammys_data():
-    '''Function to extract and load the spotify_data'''
-
-    connection = None
+def upload_data_to_db(merged_data, table_name):
     try:
-        params = configuration()
-        logging.debug('Connecting to the postgreSQL database ...')
-        with psycopg2.connect(**params) as connection:
+        # Load the database configuration
+        config = load_config()
+        db_url = f"postgresql+pg8000://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['dbname']}"
+        engine = create_engine(db_url)
+        
+        # Upload the DataFrame to the specified table
+        merged_data.to_sql(name=table_name, con=engine, index=False, if_exists='replace')
+        logging.info(f"Data successfully uploaded to the database table {table_name}.")
+    except Exception as e:
+        logging.error(f"Failed to upload data to the database: {e}")
+        raise
 
-            with connection.cursor() as crsr:
+def upload_data_to_drive(data, filename, folder_id):
+    SCOPES = ['https://www.googleapis.com/auth/drive']
+    SERVICE_ACCOUNT_FILE = '/opt/airflow/config/service_account.json'
+    credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('drive', 'v3', credentials=credentials)
 
-                crsr.execute('DROP TABLE IF EXISTS the_grammy_awards')
-
-                create_table = """
-                    CREATE TABLE IF NOT EXISTS the_grammy_award (
-                        id SERIAL PRIMARY KEY,
-                        year INT,
-                        title TEXT,
-                        published_at TIMESTAMP WITH TIME ZONE,
-                        updated_at TIMESTAMP WITH TIME ZONE,
-                        category TEXT,
-                        nominee TEXT,
-                        artist TEXT,
-                        workers TEXT,
-                        img TEXT,
-                        winner BOOLEAN);"""
-                crsr.execute(create_table)
-
-                with open('../data/the_grammy_awards.csv', newline='', encoding="utf-8") as csv_file:
-                    grammys_data = csv.reader(csv_file, delimiter=';')
-                    for index, row in enumerate(grammys_data):
-                        if index == 0:
-                            continue
-                        insert_data = crsr.mogrify("""
-                            INSERT INTO the_grammy_awards (
-                            year, title, published_at, updated_at, category, nominee, artist, workers, img, winner) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,  %s);""", row)
-                        crsr.execute(insert_data)
-                        logging.info('Grammys data successfully inserted into database!')
-                        connection.commit()
-                        return grammys_data
-    except (ImportError, psycopg2.DatabaseError) as error:
-        print(error)
-    finally:
-        if connection is not None:
-            connection.close()
-            logging.debug('Database connection terminated.')
-
-
-def merge(spotify_data, grammys_data):
-    ''' Function to do the merge between spotify_data and grammys_data '''
-
-    spotify_data.artists = spotify_data.artists.str.lower().str.split(';').str[0]
-    grammys_data.artist = grammys_data.artist.str.lower()
-
-    spotify_data.track_name = spotify_data.track_name.str.lower().str.replace(r"\(.*\)", "", regex=True)
-    grammys_data.nominee = grammys_data.nominee.str.lower().str.replace(r"\(.*\)", "", regex=True)
-
-    artists_merge = pd.merge(spotify_data, grammys_data, left_on='artists', right_on='artist', how='inner')
-    track_name_merge = pd.merge(spotify_data, grammys_data, left_on='track_name', right_on='nominee', how='inner')
-
-    final_merge = pd.concat([artists_merge, track_name_merge]).drop_duplicates()
-    final_merge.to_csv('/opt/airflow/outputs/merge.csv', index=False)
-
-    return final_merge
+    csv_bytes = data.to_csv(index=False).encode('utf-8')
+    csv_io = BytesIO(csv_bytes)
+    file_metadata = {'name': filename, 'parents': [folder_id]}
+    media = MediaIoBaseUpload(csv_io, mimetype='text/csv', resumable=True)
+    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    logging.info(f"File {filename} uploaded with ID: {file.get('id')}")
